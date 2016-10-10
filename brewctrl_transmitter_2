@@ -1,0 +1,154 @@
+#include <cmath>
+
+PRODUCT_ID(590);
+PRODUCT_VERSION(1010);
+
+// Sampling settings
+#define SAMPLETIME          200         // Sample time for measurements in ms
+#define N_SAMPLES           120         // Number of samples between each transmit
+#define N_DATA              100         // Number of samples stored
+#define MAX_SEQ_PER_PACK    2          // Maximum sequences per transmit
+
+struct Data
+{
+    bool available;
+    unsigned int seq_no;
+    unsigned long start;
+    unsigned long interval;
+    unsigned int flow;
+    unsigned int temp;
+    unsigned int battery;
+};
+
+Data stored_data[N_DATA];
+unsigned int lowest_seq_no = 0;
+
+// Define states
+enum States {MEASURE, STORE, TRANSMIT};
+States STATE = MEASURE;
+
+// Variables
+unsigned long interval = 0;
+unsigned long start = 0;
+int sensor = A1;
+unsigned int flow;
+unsigned int temp;
+unsigned int battery;
+int counter;
+int t;
+unsigned int seq_no = 0;
+String str;
+unsigned int ack[40];
+int i;
+
+int getSineWave(int t, float p, int a) {
+   return a*sin(t/p) + a;
+}
+
+
+void setup() {
+    Serial.begin(9600);
+    pinMode(sensor,INPUT);
+    delay(1000);
+    counter = 0;
+    flow = 0;
+    battery = 100;
+    t = 0;
+    Particle.publish("status", "online=true");
+    // Initialize stored data
+    for (i = 0; i < N_DATA; i++) {
+        stored_data[i].available = true;
+    }
+}
+
+void loop() {
+    switch(STATE) {
+        
+    case MEASURE :
+        if (counter == 0) {
+            flow = 0;
+            start = millis();
+        }
+        
+        if( counter >= ( N_SAMPLES ) ){
+            // Done measuring, get ready for transmit
+            interval = millis() - start;
+            flow = flow/N_SAMPLES; // Get average value
+            
+            counter = 0;
+            STATE = STORE;
+            
+        } else {
+            // Get sample from sensors
+            flow += getSineWave(t, 5000, 2048);
+            temp = getSineWave(t, 10000, 20);
+            battery = 100 - int(0.00001*t);
+            t++;
+            counter++;
+        }
+        break;
+    case STORE :
+
+        // Remove received sequences and set lowest_seq_no
+        for (int j = 0; j < N_DATA; j++) {
+            i = 0;
+            while (ack[i]) {
+                if (stored_data[j].seq_no == ack[i]) { // If sec_no has been received by server, flag storage space as available = true
+                    stored_data[j].available = true;
+                    break;
+                }
+            i++;
+            }
+            if (stored_data[j].seq_no < stored_data[lowest_seq_no].seq_no) {
+                lowest_seq_no = j;
+            }
+        }
+        
+        
+        // Insert new sequence in stored_data
+        if (stored_data[lowest_seq_no].available) { // Check if oldest seq number is available
+            stored_data[lowest_seq_no] = {false, seq_no, start, interval, flow, temp, battery};
+        } else {
+            bool placed = false;
+            for (i = 0; i < N_DATA; i++) {
+                if (stored_data[i].available) {
+                     stored_data[i] = {false, seq_no, start, interval, flow, temp, battery};
+                     placed = true;
+                     break;
+                }
+            }
+            if (!placed) {
+                stored_data[lowest_seq_no] = {false, seq_no, start, interval, flow, temp, battery}; // Overwrite oldest seq
+            }
+        }
+        
+        STATE = TRANSMIT;
+        break;
+    
+    case TRANSMIT :
+        // Create report string
+        str = "type=start,published_time_ms=" + (String)millis() + "\n"; // Package header
+        
+        int seq_per_pack = 0;
+        for (i = 0; i < N_DATA; i++) {
+            if (stored_data[i].available == false) {
+                seq_per_pack++;
+                str = str + "type=sample,seq_no="+(String)stored_data[i].seq_no + ",ms_since_start="+(String)stored_data[i].start
+                        + ",ms_interval="+(String)stored_data[i].interval + ",flow="+(String)stored_data[i].flow
+                        + ",temp="+(String)stored_data[i].temp + ",battery="+(String)stored_data[i].battery + "\n";
+            }
+            if (seq_per_pack >= MAX_SEQ_PER_PACK) {
+                break;
+            }
+        }
+
+        // Send package
+        Particle.publish("beer_measurement",  str);
+     
+        // maks 20 samtidig
+     
+        STATE = MEASURE;
+        break;
+    }
+    delay(SAMPLETIME);
+}
